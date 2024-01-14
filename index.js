@@ -363,5 +363,7 @@ async function main() {
   }
 }
 
+let executionCount = 0;
+
 // First of all main execution starts here
 main();
