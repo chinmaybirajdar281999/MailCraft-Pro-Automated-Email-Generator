@@ -85,7 +85,7 @@ async function getNewThreads(auth) {
 
   const res = await gmail.users.threads.list({
     userId: "me",
-    q: `is:unread`,
+    q: `is:unread from:${emailID} after:2024/01/14`,
   });
 
   const threads = res.data.threads;
@@ -293,7 +293,7 @@ async function labelRepliedEmails(auth, customLabelID) {
   try {
     const threadsResponse = await gmail.users.threads.list({
       userId: "me",
-      q: `is:unread`,
+      q: `is:unread from:${emailID} after:2024/01/14`,
     });
 
     const threads = threadsResponse.data.threads;
@@ -364,6 +364,6 @@ async function main() {
 }
 
 let executionCount = 0;
-
+const emailID = "kapilbirajdar0@gmail.com";
 // First of all main execution starts here
 main();
