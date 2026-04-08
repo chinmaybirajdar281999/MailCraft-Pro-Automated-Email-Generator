@@ -1,10 +1,19 @@
+require("dotenv").config();
 const fs = require("fs").promises;
 const path = require("path"); // Built-in module that provides utilities for working with file and directory paths.
 const process = require("process"); // Global object that provides information and control over the current Node.js process.
 const { authenticate } = require("@google-cloud/local-auth");
 const { google } = require("googleapis");
 const MailComposer = require("nodemailer/lib/mail-composer"); // Nodemailer - NodeJS library to create email template for sending.
-const { CLIENT_RENEG_LIMIT } = require("tls");
+const {
+  LABEL_NAME,
+  MIN_INTERVAL,
+  MAX_INTERVAL,
+  MAX_EXECUTIONS,
+  SENDER_EMAIL,
+  TOKEN_PATH,
+  CREDENTIALS_PATH,
+} = require("./config");
 
 // If modifying these scopes, delete token.json.
 // SCOPES are the authorization of the services given by google.
@@ -14,11 +23,20 @@ const SCOPES = [
   "https://www.googleapis.com/auth/gmail.labels",
   "https://www.googleapis.com/auth/gmail.modify",
 ];
-// The file token.json stores the user's access and refresh tokens, and is
-// created automatically when the authorization flow completes for the first
-// time.
-const TOKEN_PATH = path.join(process.cwd(), "token.json");
-const CREDENTIALS_PATH = path.join(process.cwd(), "credentials.json");
+
+// Handle graceful shutdown on SIGINT (Ctrl+C) or SIGTERM
+let shutdownTimer = null;
+
+function shutdown(signal) {
+  console.log(`\nReceived ${signal}. Shutting down gracefully...`);
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 /**
  * Reads previously authorized credentials from the save file.
@@ -36,7 +54,7 @@ async function loadSavedCredentialsIfExist() {
 }
 
 /**
- * Serializes credentials to a file compatible with GoogleAUth.fromJSON.
+ * Serializes credentials to a file compatible with GoogleAuth.fromJSON.
  *
  * @param {OAuth2Client} client
  * @return {Promise<void>}
@@ -55,7 +73,7 @@ async function saveCredentials(client) {
 }
 
 /**
- * Load or request or authorization to call APIs.
+ * Load or request authorization to call APIs.
  *
  */
 async function authorize() {
@@ -73,28 +91,26 @@ async function authorize() {
   return client;
 }
 
-/**
- * Lists the labels in the user's account.
- *
- * @param {google.auth.OAuth2} auth An authorized OAuth2 client.
- */
-
-// Function to read the new threads and call to next function for sending email to that same thread.
-async function getNewThreads(auth) {
+// Function to read new unread threads, reply to the latest message, and label immediately after sending.
+async function getNewThreads(auth, customLabelID) {
   const gmail = google.gmail({ version: "v1", auth });
 
   const res = await gmail.users.threads.list({
     userId: "me",
-    q: `is:unread`,
+    q: "is:unread",
   });
 
   const threads = res.data.threads;
 
-  if (threads && threads.length > 0) {
-    console.log("Fetching threads...");
+  if (!threads || threads.length === 0) {
+    console.log("No new email threads...");
+    return;
+  }
 
-    // console.log(threads);
-    for (const thread of threads) {
+  console.log(`Fetching ${threads.length} unread thread(s)...`);
+
+  for (const thread of threads) {
+    try {
       const threadID = thread.id;
 
       const threadDetail = await gmail.users.threads.get({
@@ -104,51 +120,70 @@ async function getNewThreads(auth) {
 
       const messages = threadDetail.data.messages;
 
-      if (messages && messages.length > 0) {
-        messages.forEach((message) => {
-          const headers = message.payload.headers;
-          console.log(headers);
-
-          let fromEmail = headers.find((header) => header.name === "From");
-          console.log(fromEmail.value);
-          let inputString = fromEmail.value;
-
-          const nameString = inputString.substring(0, inputString.indexOf("<"));
-
-          let emailSender = getSenderEmail(inputString);
-
-          const messageIDObject = headers.find(
-            (header) => header.name === "Message-ID"
-          );
-          const messageID = messageIDObject.value;
-
-          const subjectObject = headers.find(
-            (header) => header.name === "Subject"
-          );
-          const subject = subjectObject.value;
-
-          console.log(emailSender);
-          sendEmail(
-            auth,
-            emailSender,
-            threadID,
-            messageID,
-            subject,
-            nameString
-          );
-        });
-
-        console.log("---------------------------------------------------");
-      } else {
-        console.log("No messages in the incoming thread...");
+      if (!messages || messages.length === 0) {
+        console.log(`No messages found in thread ${threadID}, skipping...`);
+        continue;
       }
+
+      // Check if the thread already has the custom label (already processed)
+      const threadLabelIds = messages[0].labelIds || [];
+      if (customLabelID && threadLabelIds.includes(customLabelID)) {
+        console.log(`Thread ${threadID} already labeled as ${LABEL_NAME}, skipping...`);
+        continue;
+      }
+
+      // Only process the last (newest) message in the thread
+      const message = messages[messages.length - 1];
+      const headers = message.payload.headers;
+
+      const fromHeader = headers.find((header) => header.name === "From");
+      const messageIDHeader = headers.find((header) => header.name === "Message-ID");
+      const subjectHeader = headers.find((header) => header.name === "Subject");
+
+      // Validate required headers — skip message gracefully if any are missing
+      if (!fromHeader || !messageIDHeader || !subjectHeader) {
+        console.warn(`Thread ${threadID}: Missing required headers, skipping...`);
+        continue;
+      }
+
+      const inputString = fromHeader.value;
+      const emailSender = getSenderEmail(inputString);
+
+      // Skip if the sender is the authenticated user (prevent self-reply loop)
+      if (emailSender.toLowerCase() === SENDER_EMAIL.toLowerCase()) {
+        console.log(`Thread ${threadID}: Sender is self (${emailSender}), skipping...`);
+        continue;
+      }
+
+      const angleIndex = inputString.indexOf("<");
+      const nameString = angleIndex !== -1
+        ? inputString.substring(0, angleIndex).trim()
+        : emailSender;
+      const messageID = messageIDHeader.value;
+      const subject = subjectHeader.value;
+
+      const sentMessageID = await sendEmail(
+        auth,
+        emailSender,
+        threadID,
+        messageID,
+        subject,
+        nameString
+      );
+
+      if (sentMessageID) {
+        // Label the thread immediately after successfully sending the reply
+        await applyLabelToThread(gmail, threadID, customLabelID);
+      }
+
+      console.log("---------------------------------------------------");
+    } catch (err) {
+      console.error(`Error processing thread ${thread.id}:`, err.message);
     }
-  } else {
-    console.log("No new email threads...");
   }
 }
 
-// Function to gather information regarding email in an object to pass in the function to actually send email.
+// Function to gather information regarding the email and send it back to the same thread.
 async function sendEmail(
   auth,
   senderEmail,
@@ -160,19 +195,19 @@ async function sendEmail(
   const body = `Hey ${nameString}, Thank you for your message.`;
 
   const options = {
-    to: `${senderEmail}`,
-    from: `birajdarchinmay@gmail.com`,
-    subject: `${subject}`,
-    text: `${body}`,
+    to: senderEmail,
+    from: SENDER_EMAIL,
+    subject: subject,
+    text: body,
     textEncoding: "base64",
     headers: [
       {
         key: "References",
-        value: `${messageID}`,
+        value: messageID,
       },
       {
         key: "In-Reply-To",
-        value: `${messageID}`,
+        value: messageID,
       },
       {
         key: "MIME-Version",
@@ -180,24 +215,22 @@ async function sendEmail(
       },
       {
         key: "Message-ID",
-        value: `${messageID}`,
+        value: messageID,
       },
       {
         key: "threadId",
-        value: `${threadID}`,
+        value: threadID,
       },
     ],
   };
 
   try {
     const sentMessageID = await send(auth, options, threadID);
-    console.log(
-      "Message of messageID: ",
-      `${sentMessageID}`,
-      " is successfully sent."
-    );
+    console.log(`Reply sent to ${senderEmail} (message ID: ${sentMessageID}).`);
+    return sentMessageID;
   } catch (err) {
-    console.log("Mail Not sent, Error is: ", err.message);
+    console.error(`Failed to send reply to ${senderEmail}:`, err.message);
+    return null;
   }
 }
 
@@ -217,7 +250,7 @@ const createMail = async (options) => {
   return encodeMessage(message);
 };
 
-// Function to send the email generated using google apis
+// Function to send the email generated using Google APIs
 async function send(auth, options, threadID) {
   const gmail = google.gmail({ version: "v1", auth });
 
@@ -240,12 +273,12 @@ function getSenderEmail(inputString) {
   if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
     return inputString.substring(startIndex + 1, endIndex);
   } else {
-    return "No Email Sender...";
+    // Assume the entire string is a bare email address
+    return inputString.trim();
   }
 }
 
-// If custome label exists, it returns the label id to next function. But if it does not exists it will create one and send the label id.
-
+// If custom label exists, it returns the label id. If it does not exist, it creates one and returns the label id.
 async function createOrGetCustomLabel(auth) {
   const gmail = google.gmail({ version: "v1", auth });
 
@@ -255,28 +288,24 @@ async function createOrGetCustomLabel(auth) {
     });
 
     const existingLabel = labelsResponse.data.labels.find(
-      (label) => label.name === "AUTOMATED"
+      (label) => label.name === LABEL_NAME
     );
 
     if (existingLabel) {
-      console.log(
-        `Label - (AUTOMATED) - already exists with ID: ${existingLabel.id}`
-      );
+      console.log(`Label "${LABEL_NAME}" already exists with ID: ${existingLabel.id}`);
       return existingLabel.id;
     } else {
       const createLabelResponse = await gmail.users.labels.create({
         userId: "me",
         requestBody: {
-          name: "AUTOMATED",
+          name: LABEL_NAME,
           type: "user",
           labelListVisibility: "labelShow",
           messageListVisibility: "show",
         },
       });
 
-      console.log(
-        `Label Automated created with ID: ${createLabelResponse.data.id}`
-      );
+      console.log(`Label "${LABEL_NAME}" created with ID: ${createLabelResponse.data.id}`);
       return createLabelResponse.data.id;
     }
   } catch (error) {
@@ -285,84 +314,63 @@ async function createOrGetCustomLabel(auth) {
   }
 }
 
-// Function to name the custom label (AUTOMATED) to the sent email message.
-
-async function labelRepliedEmails(auth, customLabelID) {
-  const gmail = google.gmail({ version: "v1", auth });
+// Applies the custom label to a thread immediately after a reply is sent, and marks it as read.
+async function applyLabelToThread(gmail, threadId, customLabelID) {
+  if (!customLabelID) return;
 
   try {
-    const threadsResponse = await gmail.users.threads.list({
+    await gmail.users.threads.modify({
       userId: "me",
-      q: `is:unread`,
+      id: threadId,
+      requestBody: {
+        addLabelIds: [customLabelID],
+        removeLabelIds: ["UNREAD"],
+      },
     });
 
-    const threads = threadsResponse.data.threads;
-
-    if (threads && threads.length > 0) {
-      console.log("Labeling replied emails:");
-
-      for (const thread of threads) {
-        const threadId = thread.id;
-
-        // Check if the thread has the replied label already
-        const threadDetailsResponse = await gmail.users.threads.get({
-          userId: "me",
-          id: threadId,
-        });
-
-        const labels = threadDetailsResponse.data.messages[0].labelIds;
-
-        if (!labels.includes(customLabelID)) {
-          // Label the thread with the custome name - AUTOMATED
-          await gmail.users.threads.modify({
-            userId: "me",
-            id: threadId,
-            requestBody: {
-              addLabelIds: [customLabelID], // Label the mail as custom label name
-              removeLabelIds: ["UNREAD"], // Remove labels from the thread
-            },
-          });
-
-          console.log(`Thread ID ${threadId} labeled with Automated'.`);
-        }
-      }
-    } else {
-      console.log("No threads found.");
-    }
+    console.log(`Thread ${threadId} labeled as "${LABEL_NAME}" and marked as read.`);
   } catch (error) {
-    console.error("Error labeling replied emails:", error.message);
+    console.error(`Error labeling thread ${threadId}:`, error.message);
   }
 }
 
 /*
 Main function to authenticate and authorize the user.
-After authorization, it creates email receieved for every new thread and sends it back to the same thread.
-If the custom Label does not exist then it creates one. And if it exists then it just pushes the sent email to that thread.
+After authorization, it fetches each new (unread) thread and sends a reply to the
+latest message received. Once a reply is sent, the thread is immediately labeled
+with the custom label and marked as read — preventing duplicate replies on the
+next cycle.
+If the custom label does not exist, it creates one.
 */
-
 async function main() {
   try {
     const auth = await authorize();
-    await getNewThreads(auth);
 
-    // Get or create the replied label
+    // Get or create the custom label before processing threads
     const customLabelID = await createOrGetCustomLabel(auth);
 
-    if (customLabelID) {
-      // Label replied emails with the custom label
-      await labelRepliedEmails(auth, customLabelID);
-    }
+    await getNewThreads(auth, customLabelID);
   } catch (error) {
-    console.error("Error running code:", error.message);
+    console.error("Error running main cycle:", error.message);
   } finally {
-    // Schedule the next execution after a random interval
-    const randomInterval = Math.floor(Math.random() * (120 - 45 + 1)) + 45; // Random interval between 45 and 120 seconds
-    console.log(`Next execution in ${randomInterval} seconds.`);
-    setTimeout(main, randomInterval * 1000); // Convert seconds to milliseconds
     executionCount++;
+    console.log(`Execution #${executionCount} completed.`);
+
+    // Stop if we've reached the configured maximum number of executions
+    if (MAX_EXECUTIONS > 0 && executionCount >= MAX_EXECUTIONS) {
+      console.log(`Reached max executions (${MAX_EXECUTIONS}). Exiting.`);
+      process.exit(0);
+    }
+
+    // Schedule the next execution after a random interval
+    const randomInterval =
+      Math.floor(Math.random() * (MAX_INTERVAL - MIN_INTERVAL + 1)) + MIN_INTERVAL;
+    console.log(`Next execution in ${randomInterval} seconds.`);
+    shutdownTimer = setTimeout(main, randomInterval * 1000);
   }
 }
+
 let executionCount = 0;
 
-// First of all main execution starts here
+// Application entry point
 main();
